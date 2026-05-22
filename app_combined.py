@@ -214,8 +214,8 @@ def _normalizar_marcador_correto(paragraph) -> str:
 
 def _detetar_tipo(texto_bold: str, texto: str) -> str:
     t = (texto_bold + " " + texto).lower()
-    if any(k in t for k in ["selecione a opção", "escolha a opção mais adequada"]):
-        return "Lacunas (Cloze)"
+    if any(k in t for k in ["selecione a opção", "escolha a opção mais adequada", "selecione a opção correta"]):
+        return "Escolha Múltipla"
     if any(k in t for k in ["complete o texto", "complete as frases com palavras"]):
         return "Lacunas (Escrita)"
     if any(k in t for k in ["complete as frases da coluna", "faça corresponder", "associe"]):
@@ -261,6 +261,46 @@ def extrair_perguntas_docx(uploaded_file, start_id: int = 1) -> pd.DataFrame:
         enunciado = buffer_enunciado.strip()
         if not enunciado and not buffer_pares:
             return
+
+        # INTERCEÇÃO INTELIGENTE: Se for Escolha Múltipla com subperguntas numeradas
+        if estado == "Escolha Múltipla" or (estado == "Lacunas (Cloze)" and re.search(r'\d+\.\s*.*?_______.*?\n\s*a\)', enunciado, re.IGNORECASE)):
+            padrao_bloco = re.compile(
+                r'(\d+)\.\s*(.*?_______.*?)\s*((?:[a-d]\).*?\n?)+)(?=\n\d+\.|\Z)', 
+                re.DOTALL | re.IGNORECASE
+            )
+            blocos_questoes = padrao_bloco.findall(enunciado)
+            
+            if blocos_questoes:
+                for num, sub_enunciado, bloco_opcoes in blocos_questoes:
+                    opcoes = re.findall(r'([a-d])\)\s*(.*?)(?=\s*[a-d]\)|\Z)', bloco_opcoes, re.DOTALL)
+                    opcoes_dict = {a.lower().strip(): t.strip() for a, t in opcoes}
+                    
+                    resposta_correta = "a"
+                    for alinea, texto_opt in opcoes_dict.items():
+                        if "*" in texto_opt:
+                            opcoes_dict[alinea] = texto_opt.replace("*", "").strip()
+                            resposta_correta = alinea
+                    
+                    perguntas.append({
+                        "Exportar": True,
+                        "ID":       f"Q{contador:02d}",
+                        "Secção":   secao_atual if secao_atual else "Escolha Múltipla",
+                        "Enunciado": f"{sub_enunciado.strip()}",
+                        "Pares":    [],
+                        "Tipo":     "Escolha Múltipla",
+                        "Nível":    st.session_state.nivel_global,
+                        "Tópico":   "Tema 1",
+                        "choice_a":  opcoes_dict.get("a", ""),
+                        "choice_b":  opcoes_dict.get("b", ""),
+                        "choice_c":  opcoes_dict.get("c", ""),
+                        "choice_d":  opcoes_dict.get("d", ""),
+                        "answer":    resposta_correta
+                    })
+                    contador += 1
+                buffer_enunciado, buffer_pares = "", []
+                return
+
+        # Comportamento padrão para os restantes tipos de perguntas
         perguntas.append({
             "Exportar": True,
             "ID":       f"Q{contador:02d}",
@@ -270,6 +310,7 @@ def extrair_perguntas_docx(uploaded_file, start_id: int = 1) -> pd.DataFrame:
             "Tipo":     estado,
             "Nível":    st.session_state.nivel_global,
             "Tópico":   "Tema 1",
+            "choice_a": "", "choice_b": "", "choice_c": "", "choice_d": "", "answer": ""
         })
         contador += 1
         buffer_enunciado, buffer_pares = "", []
@@ -396,7 +437,6 @@ with st.sidebar:
 
     # Função inteligente para navegar sem esconder botões
     def _nav_global(label, view, module):
-        # Verifica se estamos na view e no módulo certos para pintar de azul
         is_active = (st.session_state.modulo_ativo == module) and (
             (module == "editor" and st.session_state.active_view == view) or 
             (module == "importador" and st.session_state.imp_view == view)
@@ -423,7 +463,7 @@ with st.sidebar:
     _nav_global("🔄 Conversor PEAKIT", "Conversor_CSV", "importador")
 
     st.markdown("---")
-    st.caption("Métricas Moodle (Ficha Manual)")
+    st.markdown("⚡ *Métricas Ficha Manual*")
     c1, c2 = st.columns(2)
     c1.metric("Questões", len(ta.questions))
     pts = sum(q.meta.points for q in ta.questions if q.meta.points)
@@ -502,7 +542,7 @@ def render_editor_dashboard():
                         if st.button("🗑️ Apagar", key=f"cd_{q.qid}", use_container_width=True):
                             delete_question(idx)
                             st.rerun()
-# 👇 NOVO CÓDIGO AQUI NO FUNDO DA FUNÇÃO 👇
+
     st.markdown("---")
     st.markdown("### 📦 Finalizar Ficha Manual")
     if st.button("🚀 Validar e Exportar para Moodle XML", type="primary"):
@@ -739,7 +779,6 @@ def _editor_save(q):
 
 
 def render_editor_exportar():
-    # 👇 NOVO CÓDIGO: Botão de voltar 👇
     c_back, c_tit = st.columns([1, 6])
     if c_back.button("🔙 Voltar ao Painel"):
         st.session_state.active_view = "Dashboard"
@@ -747,8 +786,6 @@ def render_editor_exportar():
 
     c_tit.header("📦 Exportar Ficha")
 
-    issues = validate_ficha(ta)
-    # ... (o resto da função mantém-se intocado)
     issues = validate_ficha(ta)
     update_ficha_status(ta, issues)
 
@@ -790,6 +827,11 @@ def render_imp_dashboard():
             st.write("")
         return
 
+    # Injeta de forma segura colunas de Escolha Múltipla caso não existam no DataFrame
+    for c in ["choice_a", "choice_b", "choice_c", "choice_d", "answer"]:
+        if c not in df_atual.columns:
+            df_atual[c] = ""
+
     c_tot, c_view = st.columns([4, 1.5])
     c_tot.subheader(f"Questões no carrinho ({len(df_atual)})")
     view_mode = c_view.radio("Modo:", ["Tabela", "Cartões"], horizontal=True, label_visibility="collapsed")
@@ -802,7 +844,7 @@ def render_imp_dashboard():
     st.divider()
 
     if view_mode == "Tabela":
-        cols_visiveis = [c for c in ["Exportar", "ID", "Secção", "Tipo", "Nível", "Tópico", "Enunciado"] if c in df_atual.columns]
+        cols_visiveis = [c for c in ["Exportar", "ID", "Secção", "Tipo", "Nível", "Tópico", "Enunciado", "choice_a", "choice_b", "choice_c", "choice_d", "answer"] if c in df_atual.columns]
         edited = st.data_editor(
             df_atual[cols_visiveis],
             use_container_width=True,
@@ -816,6 +858,11 @@ def render_imp_dashboard():
                 "Nível":     st.column_config.SelectboxColumn("Nível", options=NIVEL_OPTIONS, width="small"),
                 "Tópico":    st.column_config.SelectboxColumn("Tópico", options=TOPICO_OPTIONS, width="small"),
                 "Enunciado": st.column_config.TextColumn("Enunciado", width="large"),
+                "choice_a":  st.column_config.TextColumn("Opção A", width="medium"),
+                "choice_b":  st.column_config.TextColumn("Opção B", width="medium"),
+                "choice_c":  st.column_config.TextColumn("Opção C", width="medium"),
+                "choice_d":  st.column_config.TextColumn("Opção D", width="medium"),
+                "answer":    st.column_config.SelectboxColumn("Correta", options=["a", "b", "c", "d"], width="small"),
             },
             key="tabela_carrinho"
         )
@@ -854,7 +901,6 @@ def render_imp_dashboard():
                         st.session_state.perguntas_df = df_atual.drop(index=idx).reset_index(drop=True)
                         st.rerun()
 
-    # Substitui toda a zona inferior da função por isto:
     st.divider()
     c_edit, c_exp = st.columns([1.5, 1])
 
@@ -870,7 +916,7 @@ def render_imp_dashboard():
                 st.rerun()
 
     with c_exp:
-        st.markdown("#### 💾 Exportação de Segurança")
+        st.markdown("#### 💾 Exportação de Conteúdos")
         if not st.session_state.perguntas_df.empty:
             csv = st.session_state.perguntas_df.to_csv(index=False).encode('utf-8')
             st.download_button(
@@ -878,6 +924,37 @@ def render_imp_dashboard():
                 data=csv,
                 file_name="triagem_babelium.csv",
                 mime="text/csv",
+                use_container_width=True,
+                type="secondary"
+            )
+            
+            st.write("")
+            
+            # GERAÇÃO E EXPORTAÇÃO NATIVA DO BANCO DE PERGUNTAS EM MOODLE XML
+            from utils import gerar_moodle_xml
+            lista_triagem = st.session_state.perguntas_df.to_dict(orient="records")
+            
+            lista_adaptada = []
+            for item in lista_triagem:
+                lista_adaptada.append({
+                    "name": item.get("ID", "Pergunta"),
+                    "questiontext": item.get("Enunciado", ""),
+                    "choice_a": item.get("choice_a", ""),
+                    "choice_b": item.get("choice_b", ""),
+                    "choice_c": item.get("choice_c", ""),
+                    "choice_d": item.get("choice_d", ""),
+                    "answer": item.get("answer", "a"),
+                    "Exportar": item.get("Exportar", True)
+                })
+            
+            lista_filtrada = [q for q in lista_adaptada if q.get("Exportar", True)]
+            xml_ready = gerar_moodle_xml(lista_filtrada)
+            
+            st.download_button(
+                label="📦 Exportar para Moodle XML",
+                data=xml_ready,
+                file_name=f"moodle_fichas_{time.strftime('%Y%m%d')}.xml",
+                mime="application/xml",
                 use_container_width=True,
                 type="primary"
             )
@@ -980,6 +1057,7 @@ def render_imp_gerador_ia():
                 "Tipo":      exemplo["tipo"],
                 "Nível":     nivel,
                 "Tópico":    topico if topico else "Tema 1",
+                "choice_a":  "", "choice_b": "", "choice_c": "", "choice_d": "", "answer": ""
             }
             st.session_state.perguntas_df = pd.concat(
                 [st.session_state.perguntas_df, pd.DataFrame([nova_linha])],
@@ -1103,14 +1181,14 @@ def render_imp_detalhes():
         st.session_state.imp_view = "Dashboard"
         st.rerun()
 
-# ==============================================================================
+
+# ══════════════════════════════════════════════════════════════════
 # VIEW: CONVERSOR PEAKIT -> MOODLE
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════
 
 def render_conversor_CSV():
     st.title("🔄 Conversor PEAKIT -> Moodle")
     
-    # --- MANUAL DE UTILIZADOR INTEGRADO ---
     with st.expander("📖 GUIA DE UTILIZAÇÃO: Como converter e importar"):
         st.markdown("""
         ### 1. No Portal PEAKIT
@@ -1192,7 +1270,6 @@ def render_conversor_CSV():
             
             st.success("✅ Ficheiro processado com sucesso!")
             
-            # Interface de edição
             df_final = st.data_editor(df_moodle, use_container_width=True, hide_index=True)
             
             csv_ready = df_final.to_csv(
@@ -1210,6 +1287,7 @@ def render_conversor_CSV():
             
         except Exception as e:
             st.error(f"Erro ao processar o ficheiro: {e}")
+
 
 # ══════════════════════════════════════════════════════════════════
 # ROUTER PRINCIPAL
